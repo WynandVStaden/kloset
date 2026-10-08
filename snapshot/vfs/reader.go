@@ -17,12 +17,16 @@ const default_prefetchSize = 4 * 1024 * 1024
 
 const (
 	// maxReadahead caps a readahead window. A reader holds at most the
-	// window it consumes plus the next one in flight.
+	// window it consumes plus readaheadDepth ones in flight.
 	maxReadahead = 32 << 20
+
+	// readaheadDepth is the number of windows in flight past the one being
+	// consumed.
+	readaheadDepth = 2
 
 	// readaheadConcurrency is the number of range reads, of at most 4MB,
 	// GetBlobs runs in parallel for a window.
-	readaheadConcurrency = 4
+	readaheadConcurrency = 8
 )
 
 type ObjectReader struct {
@@ -312,8 +316,9 @@ func (or *ObjectReader) ReadAt(p []byte, off int64) (int, error) {
 }
 
 // readahead reads an object sequentially, fetching ahead in the background,
-// kernel style: when the reader starts consuming a window, the next one, twice
-// as large up to maxReadahead, is already in flight.
+// kernel style: when the reader starts consuming a window, the next
+// readaheadDepth ones, each twice as large as the previous up to maxReadahead,
+// are already in flight.
 type readahead struct {
 	repo   *repository.Repository
 	chunks []objects.Chunk
@@ -323,7 +328,8 @@ type readahead struct {
 	buf     []byte   // unread part of the current chunk
 	pending [][]byte // next chunks of the current window
 	size    int      // size of the last window issued
-	next    *raWindow
+	issued  int      // chunk index past the last window issued
+	ahead   []*raWindow
 }
 
 // raWindow is the run of chunks [start, end) fetched by its own goroutine.
@@ -350,7 +356,7 @@ func newReadahead(repo *repository.Repository, chunks []objects.Chunk, objoff in
 	}
 
 	if objoff < len(chunks) {
-		ra.next = ra.startWindow(objoff, size)
+		ra.ahead = append(ra.ahead, ra.startWindow(objoff, size))
 	}
 	return ra
 }
@@ -375,18 +381,18 @@ func (ra *readahead) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// advance launches the window after the one in flight, then waits for the
-// latter and makes it current.
+// advance takes the oldest window in flight, tops up the ones behind it to
+// readaheadDepth, then waits for the former and makes it current.
 func (ra *readahead) advance() error {
-	w := ra.next
-	if w == nil {
+	if len(ra.ahead) == 0 {
 		return io.EOF
 	}
 
-	ra.next = nil
-	if w.end < len(ra.chunks) {
+	w := ra.ahead[0]
+	ra.ahead = ra.ahead[1:]
+	for len(ra.ahead) < readaheadDepth && ra.issued < len(ra.chunks) {
 		ra.size = min(2*ra.size, maxReadahead)
-		ra.next = ra.startWindow(w.end, ra.size)
+		ra.ahead = append(ra.ahead, ra.startWindow(ra.issued, ra.size))
 	}
 
 	t0 := time.Now()
@@ -416,6 +422,7 @@ func (ra *readahead) startWindow(start, size int) *raWindow {
 		bytes += int(ra.chunks[end].Length)
 		end++
 	}
+	ra.issued = end
 
 	ctx, cancel := context.WithCancel(ra.repo.AppContext())
 	w := &raWindow{
@@ -438,15 +445,15 @@ func (ra *readahead) startWindow(start, size int) *raWindow {
 	return w
 }
 
-// close cancels the window in flight, if any, and waits for its goroutine.
+// close cancels the windows in flight and waits for their goroutines.
 func (ra *readahead) close() {
-	if ra.next == nil {
-		return
+	for _, w := range ra.ahead {
+		w.cancel()
 	}
-
-	ra.next.cancel()
-	<-ra.next.done
-	ra.next = nil
+	for _, w := range ra.ahead {
+		<-w.done
+	}
+	ra.ahead = nil
 }
 
 // fetchChunks returns the decoded chunks, in order, fetched as one GetBlobs
